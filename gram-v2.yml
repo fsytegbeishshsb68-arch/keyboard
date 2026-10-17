@@ -1,0 +1,1115 @@
+name: Build KenzO Gram
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo fallocate -l 8G /swapfile || true
+          sudo chmod 600 /swapfile || true
+          sudo mkswap /swapfile || true
+          sudo swapon /swapfile || true
+          df -h /
+          free -g
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Download Telegram source (pinned version)
+        run: |
+          set -e
+          git init tg
+          cd tg
+          git remote add origin https://github.com/DrKLO/Telegram.git
+          git fetch --depth 1 origin f32ffeec763f0bdbf4bec25b52d654f77bff733d
+          git checkout FETCH_HEAD
+          ok=0
+          for i in 1 2 3; do
+            if git submodule update --init --recursive --depth 1 --jobs 4; then ok=1; break; fi
+            echo "shallow submodule fetch failed, trying full fetch ($i)"
+            if git submodule update --init --recursive --jobs 4; then ok=1; break; fi
+          done
+          if [ "$ok" != "1" ]; then echo "PATCH-ERROR: could not download submodules"; exit 1; fi
+          if git submodule status --recursive | grep -q '^-'; then echo "PATCH-ERROR: some submodules are missing"; exit 1; fi
+          df -h /
+
+      - name: Install Android SDK parts
+        run: |
+          set -e
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          sudo chown -R "$(id -u):$(id -g)" "$SDK"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SM" ]; then SM="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager | head -1)"; fi
+          yes | "$SM" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SM" --sdk_root="$SDK" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "sdk.dir=$SDK" > tg/local.properties
+
+      - name: Apply KenzO changes
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          set -o pipefail
+          sudo apt-get install -y python3-pil > /dev/null || python3 -m pip install --break-system-packages pillow
+          python3 -c "import PIL; print('pillow ok')"
+          cat > patch.py <<'PYEOF'
+          import base64
+          import io
+          import json
+          import os
+          import re
+          import sys
+
+          ROOT = sys.argv[1]
+          ICON_B64 = open(sys.argv[2]).read().strip()
+          APP_ID = os.environ.get("TG_API_ID", "").strip()
+          APP_HASH = os.environ.get("TG_API_HASH", "").strip()
+          NEW_PACKAGE = "com.kenzo.gram"
+          NEW_NAME = "KenzO Gram"
+
+
+          def path(*parts):
+              return os.path.join(ROOT, *parts)
+
+
+          def fail(msg):
+              print("PATCH-ERROR: " + msg)
+              sys.exit(1)
+
+
+          def read(p):
+              with open(p, encoding="utf-8") as f:
+                  return f.read()
+
+
+          def write(p, s):
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(s)
+
+
+          def replace_exact(p, old, new, expected=1):
+              s = read(p)
+              n = s.count(old)
+              if n != expected:
+                  fail("%s: expected %d match(es) of %r, found %d" % (p, expected, old, n))
+              write(p, s.replace(old, new))
+
+
+          def replace_regex(p, pattern, repl, expected=1):
+              s = read(p)
+              matches = re.findall(pattern, s)
+              if len(matches) != expected:
+                  fail("%s: expected %d match(es) of regex %r, found %d" % (p, expected, pattern, len(matches)))
+              write(p, re.sub(pattern, lambda m: repl(m), s))
+
+
+          # ---------------------------------------------------------------- credentials
+          if not APP_ID.isdigit():
+              fail("TG_API_ID is missing or not a number. Add it in Settings > Secrets and variables > Actions.")
+          if not re.fullmatch(r"[0-9a-fA-F]{32}", APP_HASH):
+              fail("TG_API_HASH is missing or is not a 32-character hash. Add it in Settings > Secrets and variables > Actions.")
+
+          build_vars = path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "BuildVars.java")
+          replace_regex(build_vars, r"(public static int APP_ID = )\d+;", lambda m: m.group(1) + APP_ID + ";")
+          replace_regex(build_vars, r'(public static String APP_HASH = ")[0-9a-fA-F]+(";)', lambda m: m.group(1) + APP_HASH + m.group(2))
+          replace_exact(build_vars, "public static boolean CHECK_UPDATES = true;", "public static boolean CHECK_UPDATES = false;")
+
+          # ---------------------------------------------------------------- package name
+          props = path("gradle.properties")
+          replace_exact(props, "APP_PACKAGE=org.telegram.messenger", "APP_PACKAGE=" + NEW_PACKAGE)
+          replace_exact(props, "org.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=1g", "org.gradle.jvmargs=-Xmx6g -XX:MaxMetaspaceSize=1g")
+
+          gs = path("TMessagesProj_App", "google-services.json")
+          s = read(gs)
+          if s.count("org.telegram.messenger") < 1:
+              fail("google-services.json has no package names to rewrite")
+          write(gs, s.replace("org.telegram.messenger", NEW_PACKAGE))
+          json.loads(read(gs))  # still valid json
+
+          # ---------------------------------------------------------------- build size / memory
+          app_gradle = path("TMessagesProj_App", "build.gradle")
+          replace_exact(app_gradle, 'abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"', 'abiFilters "arm64-v8a"', expected=2)
+          replace_exact(app_gradle, "minifyEnabled true", "minifyEnabled false", expected=2)
+          replace_exact(app_gradle, "shrinkResources true", "shrinkResources false", expected=2)
+
+          lib_gradle = path("TMessagesProj", "build.gradle")
+          replace_exact(
+              lib_gradle,
+              "        externalNativeBuild {\n            cmake {\n                version '3.22.1'",
+              "        ndk { abiFilters \"arm64-v8a\" }\n        externalNativeBuild {\n            cmake {\n                version '3.22.1'",
+          )
+
+          # ---------------------------------------------------------------- the speed change
+          group_call = path("TMessagesProj", "jni", "tgcalls", "tgcalls", "group", "GroupInstanceCustomImpl.cpp")
+          replace_exact(
+              group_call,
+              "audioOptions.audio_jitter_buffer_min_delay_ms = 50;",
+              "audioOptions.audio_jitter_buffer_min_delay_ms = 0;\n"
+              "            audioOptions.audio_jitter_buffer_max_packets = 30;",
+          )
+
+          # ---------------------------------------------------------------- network latency
+          sock = path("TMessagesProj", "jni", "tgnet", "ConnectionSocket.cpp")
+          replace_exact(sock, "#include <netinet/tcp.h>\n", "#include <netinet/tcp.h>\n#include <netinet/in.h>\n")
+          replace_exact(
+              sock,
+              "    if (setsockopt(socketFd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int))) {\n"
+              "        if (LOGS_ENABLED) DEBUG_E(\"connection(%p) set TCP_NODELAY failed\", this);\n"
+              "    }\n",
+              "    if (setsockopt(socketFd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int))) {\n"
+              "        if (LOGS_ENABLED) DEBUG_E(\"connection(%p) set TCP_NODELAY failed\", this);\n"
+              "    }\n"
+              "    {\n"
+              "        // KenzO: ask the network to treat this connection as low-delay traffic (DSCP EF)\n"
+              "        int tos = 0xB8;\n"
+              "        if (ipv6) {\n"
+              "#ifdef IPV6_TCLASS\n"
+              "            setsockopt(socketFd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos));\n"
+              "#endif\n"
+              "        } else {\n"
+              "#ifdef IP_TOS\n"
+              "            setsockopt(socketFd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));\n"
+              "#endif\n"
+              "        }\n"
+              "    }\n",
+          )
+
+          kenzo_net = """package org.telegram.messenger;
+
+          import android.app.Activity;
+          import android.app.Application;
+          import android.content.Context;
+          import android.net.wifi.WifiManager;
+          import android.os.Build;
+          import android.os.Bundle;
+
+          /** KenzO: keeps Wi-Fi in low-latency mode while the app is on screen. */
+          public class KenzoNet implements Application.ActivityLifecycleCallbacks {
+
+              private static boolean started;
+
+              private final Context context;
+              private WifiManager.WifiLock lock;
+              private int resumed;
+
+              public static void start(Application app) {
+                  if (started) {
+                      return;
+                  }
+                  started = true;
+                  try {
+                      app.registerActivityLifecycleCallbacks(new KenzoNet(app));
+                  } catch (Throwable ignore) {
+                  }
+              }
+
+              private KenzoNet(Context context) {
+                  this.context = context.getApplicationContext();
+              }
+
+              private void acquire() {
+                  try {
+                      if (lock == null) {
+                          WifiManager wm = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+                          if (wm == null) {
+                              return;
+                          }
+                          int mode = Build.VERSION.SDK_INT >= 29
+                                  ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                                  : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                          lock = wm.createWifiLock(mode, "kenzo-lowlatency");
+                          lock.setReferenceCounted(false);
+                      }
+                      if (!lock.isHeld()) {
+                          lock.acquire();
+                      }
+                  } catch (Throwable ignore) {
+                  }
+              }
+
+              private void release() {
+                  try {
+                      if (lock != null && lock.isHeld()) {
+                          lock.release();
+                      }
+                  } catch (Throwable ignore) {
+                  }
+              }
+
+              @Override
+              public void onActivityResumed(Activity activity) {
+                  resumed++;
+                  acquire();
+              }
+
+              @Override
+              public void onActivityPaused(Activity activity) {
+                  resumed--;
+                  if (resumed <= 0) {
+                      resumed = 0;
+                      release();
+                  }
+              }
+
+              @Override
+              public void onActivityCreated(Activity activity, Bundle savedInstanceState) {
+              }
+
+              @Override
+              public void onActivityStarted(Activity activity) {
+              }
+
+              @Override
+              public void onActivityStopped(Activity activity) {
+              }
+
+              @Override
+              public void onActivitySaveInstanceState(Activity activity, Bundle outState) {
+              }
+
+              @Override
+              public void onActivityDestroyed(Activity activity) {
+              }
+          }
+          """
+          write(path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "KenzoNet.java"), kenzo_net)
+          replace_exact(
+              path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "ApplicationLoader.java"),
+              "        super.onCreate();\n\n        // AndroidUtilities must be initialized before FileLog",
+              "        super.onCreate();\n        KenzoNet.start(this);\n\n        // AndroidUtilities must be initialized before FileLog",
+          )
+
+          # ---------------------------------------------------------------- v2 features
+          MSG = path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger")
+
+          # latency meter -------------------------------------------------------------
+          replace_exact(
+              path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "KenzoNet.java"),
+              "    private static boolean started;",
+              """    private static boolean started;
+              private static final java.util.HashMap<Integer, Long> sendTimes = new java.util.HashMap<>();
+
+              public static boolean meterOn() {
+                  try {
+                      return ApplicationLoader.applicationContext.getSharedPreferences("kenzo", Context.MODE_PRIVATE).getBoolean("meter", true);
+                  } catch (Throwable e) {
+                      return true;
+                  }
+              }
+
+              public static boolean toggleMeter() {
+                  boolean now = !meterOn();
+                  try {
+                      ApplicationLoader.applicationContext.getSharedPreferences("kenzo", Context.MODE_PRIVATE).edit().putBoolean("meter", now).apply();
+                  } catch (Throwable ignore) {
+                  }
+                  return now;
+              }
+
+              public static void markSend(int id) {
+                  try {
+                      synchronized (sendTimes) {
+                          if (sendTimes.size() > 200) {
+                              sendTimes.clear();
+                          }
+                          if (!sendTimes.containsKey(id)) {
+                              sendTimes.put(id, android.os.SystemClock.elapsedRealtime());
+                          }
+                      }
+                  } catch (Throwable ignore) {
+                  }
+              }
+
+              public static void onSent(int id) {
+                  try {
+                      Long t;
+                      synchronized (sendTimes) {
+                          t = sendTimes.remove(id);
+                      }
+                      if (t == null || !meterOn()) {
+                          return;
+                      }
+                      long ms = android.os.SystemClock.elapsedRealtime() - t;
+                      String s = String.format(java.util.Locale.US, "%.2f", ms / 1000.0) + " s  (" + ms + " ms)";
+                      android.widget.Toast.makeText(ApplicationLoader.applicationContext, s, android.widget.Toast.LENGTH_SHORT).show();
+                  } catch (Throwable ignore) {
+                  }
+              }""",
+          )
+          SMH = path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "SendMessagesHelper.java")
+          replace_exact(
+              SMH,
+              "    protected void performSendMessageRequest(final TLObject req, final MessageObject msgObj, final String originalPath, DelayedMessage parentMessage, boolean check, DelayedMessage delayedMessage, Object parentObject, HashMap<String, String> params, boolean scheduled) {\n",
+              "    protected void performSendMessageRequest(final TLObject req, final MessageObject msgObj, final String originalPath, DelayedMessage parentMessage, boolean check, DelayedMessage delayedMessage, Object parentObject, HashMap<String, String> params, boolean scheduled) {\n        if (msgObj != null && msgObj.messageOwner != null) {\n            KenzoNet.markSend(msgObj.messageOwner.id);\n        }\n",
+          )
+          replace_exact(
+              SMH,
+              "                    if (error == null) {\n                        final int oldId = newMsgObj.id;\n                        final ArrayList<TLRPC.Message> sentMessages = new ArrayList<>();\n                        final String attachPath = newMsgObj.attachPath;\n",
+              "                    if (error == null) {\n                        final int oldId = newMsgObj.id;\n                        KenzoNet.onSent(oldId);\n                        final ArrayList<TLRPC.Message> sentMessages = new ArrayList<>();\n                        final String attachPath = newMsgObj.attachPath;\n",
+          )
+
+          # deleted messages store ------------------------------------------------------
+          kenzo_deleted = """package org.telegram.messenger;
+
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.database.Cursor;
+          import android.database.sqlite.SQLiteOpenHelper;
+          import android.text.TextUtils;
+
+          import org.telegram.SQLite.SQLiteCursor;
+          import org.telegram.SQLite.SQLiteDatabase;
+          import org.telegram.tgnet.NativeByteBuffer;
+          import org.telegram.tgnet.TLRPC;
+
+          import java.util.ArrayList;
+          import java.util.Locale;
+
+          /** KenzO: remembers ordinary deleted messages (text and a media label). */
+          public class KenzoDeleted {
+
+              private static class Helper extends SQLiteOpenHelper {
+                  Helper(Context c) {
+                      super(c, "kenzo_deleted.db", null, 1);
+                  }
+
+                  @Override
+                  public void onCreate(android.database.sqlite.SQLiteDatabase db) {
+                      db.execSQL("CREATE TABLE IF NOT EXISTS del (acc INTEGER, did INTEGER, mid INTEGER, sender INTEGER, date INTEGER, out INTEGER, kind TEXT, body TEXT, saved INTEGER, PRIMARY KEY (acc, did, mid))");
+                  }
+
+                  @Override
+                  public void onUpgrade(android.database.sqlite.SQLiteDatabase db, int o, int n) {
+                  }
+              }
+
+              private static Helper helper;
+
+              private static synchronized Helper h() {
+                  if (helper == null) {
+                      helper = new Helper(ApplicationLoader.applicationContext);
+                  }
+                  return helper;
+              }
+
+              /** Called on the storage thread just before messages are removed. */
+              public static void snapshot(int account, SQLiteDatabase tg, long dialogId, ArrayList<Integer> mids, int mode) {
+                  SQLiteCursor c = null;
+                  try {
+                      if (mode != 0 || mids == null || mids.isEmpty() || mids.size() > 300) {
+                          return;
+                      }
+                      String ids = TextUtils.join(",", mids);
+                      if (dialogId != 0) {
+                          c = tg.queryFinalized(String.format(Locale.US, "SELECT uid, data, mid FROM messages_v2 WHERE mid IN(%s) AND uid = %d", ids, dialogId));
+                      } else {
+                          c = tg.queryFinalized(String.format(Locale.US, "SELECT uid, data, mid FROM messages_v2 WHERE mid IN(%s) AND is_channel = 0", ids));
+                      }
+                      ArrayList<ContentValues> rows = new ArrayList<>();
+                      while (c.next()) {
+                          long did = c.longValue(0);
+                          int mid = c.intValue(2);
+                          if (mid <= 0 || DialogObject.isEncryptedDialog(did)) {
+                              continue;
+                          }
+                          NativeByteBuffer data = c.byteBufferValue(1);
+                          if (data == null) {
+                              continue;
+                          }
+                          TLRPC.Message m = TLRPC.Message.TLdeserialize(data, data.readInt32(false), false);
+                          data.reuse();
+                          if (m == null || m.action != null || m.ttl > 0 || MessageObject.isSecretMedia(m)) {
+                              continue;
+                          }
+                          String text = m.message == null ? "" : m.message;
+                          String kind = "";
+                          if (m.media != null && !(m.media instanceof TLRPC.TL_messageMediaEmpty)) {
+                              kind = m.media.getClass().getSimpleName().replace("TL_messageMedia", "");
+                          }
+                          if (text.length() == 0 && kind.length() == 0) {
+                              continue;
+                          }
+                          ContentValues v = new ContentValues();
+                          v.put("acc", account);
+                          v.put("did", did);
+                          v.put("mid", mid);
+                          v.put("sender", MessageObject.getFromChatId(m));
+                          v.put("date", m.date);
+                          v.put("out", m.out ? 1 : 0);
+                          v.put("kind", kind);
+                          v.put("body", text);
+                          v.put("saved", System.currentTimeMillis());
+                          rows.add(v);
+                      }
+                      c.dispose();
+                      c = null;
+                      if (!rows.isEmpty()) {
+                          android.database.sqlite.SQLiteDatabase db = h().getWritableDatabase();
+                          for (ContentValues v : rows) {
+                              db.insertWithOnConflict("del", null, v, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE);
+                          }
+                      }
+                  } catch (Throwable ignore) {
+                      try {
+                          if (c != null) {
+                              c.dispose();
+                          }
+                      } catch (Throwable ignore2) {
+                      }
+                  }
+              }
+
+              /** Rows: did, sender, date, out, kind, body. did == 0 means all chats. */
+              public static ArrayList<Object[]> list(int account, long did) {
+                  ArrayList<Object[]> out = new ArrayList<>();
+                  Cursor c = null;
+                  try {
+                      android.database.sqlite.SQLiteDatabase db = h().getReadableDatabase();
+                      if (did != 0) {
+                          c = db.rawQuery("SELECT did, sender, date, out, kind, body FROM del WHERE acc = ? AND did = ? ORDER BY saved DESC LIMIT 2000", new String[]{"" + account, "" + did});
+                      } else {
+                          c = db.rawQuery("SELECT did, sender, date, out, kind, body FROM del WHERE acc = ? ORDER BY saved DESC LIMIT 2000", new String[]{"" + account});
+                      }
+                      while (c.moveToNext()) {
+                          out.add(new Object[]{c.getLong(0), c.getLong(1), c.getLong(2), c.getInt(3), c.getString(4), c.getString(5)});
+                      }
+                  } catch (Throwable ignore) {
+                  } finally {
+                      if (c != null) {
+                          c.close();
+                      }
+                  }
+                  return out;
+              }
+
+              public static void clear(int account, long did) {
+                  try {
+                      android.database.sqlite.SQLiteDatabase db = h().getWritableDatabase();
+                      if (did != 0) {
+                          db.execSQL("DELETE FROM del WHERE acc = " + account + " AND did = " + did);
+                      } else {
+                          db.execSQL("DELETE FROM del WHERE acc = " + account);
+                      }
+                  } catch (Throwable ignore) {
+                  }
+              }
+          }
+          """
+          write(path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "KenzoDeleted.java"), kenzo_deleted)
+
+          kenzo_act = """package org.telegram.messenger;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.BaseAdapter;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ListView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import org.telegram.tgnet.TLRPC;
+
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Date;
+          import java.util.Locale;
+
+          /** KenzO: list of deleted messages. */
+          public class KenzoDeletedActivity extends Activity {
+
+              private int account;
+              private long did;
+              private ArrayList<Object[]> items = new ArrayList<>();
+              private BaseAdapter adapter;
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private String nameOf(long id) {
+                  try {
+                      if (id > 0) {
+                          TLRPC.User u = MessagesController.getInstance(account).getUser(id);
+                          if (u != null) {
+                              return UserObject.getUserName(u);
+                          }
+                      } else if (id < 0) {
+                          TLRPC.Chat ch = MessagesController.getInstance(account).getChat(-id);
+                          if (ch != null) {
+                              return ch.title;
+                          }
+                      }
+                  } catch (Throwable ignore) {
+                  }
+                  return "" + id;
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  account = getIntent().getIntExtra("account", 0);
+                  did = getIntent().getLongExtra("did", 0L);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setBackgroundColor(Color.BLACK);
+                  root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+
+                  TextView title = new TextView(this);
+                  title.setText("\\u0627\\u0644\\u0645\\u062d\\u0630\\u0648\\u0641\\u0627\\u062a");
+                  title.setTextColor(Color.WHITE);
+                  title.setTextSize(22);
+                  title.setPadding(dp(16), dp(24), dp(16), dp(8));
+                  root.addView(title);
+
+                  Button clear = new Button(this);
+                  clear.setText("\\u0645\\u0633\\u062d \\u0627\\u0644\\u0643\\u0644");
+                  clear.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          new AlertDialog.Builder(KenzoDeletedActivity.this)
+                                  .setMessage("\\u0645\\u0633\\u062d \\u0643\\u0644 \\u0627\\u0644\\u0645\\u062d\\u0630\\u0648\\u0641\\u0627\\u062a\\u061f")
+                                  .setPositiveButton("\\u0646\\u0639\\u0645", new android.content.DialogInterface.OnClickListener() {
+                                      @Override
+                                      public void onClick(android.content.DialogInterface d, int w) {
+                                          KenzoDeleted.clear(account, did);
+                                          reload();
+                                      }
+                                  })
+                                  .setNegativeButton("\\u0644\\u0627", null)
+                                  .show();
+                      }
+                  });
+                  root.addView(clear);
+
+                  ListView list = new ListView(this);
+                  list.setDividerHeight(1);
+                  adapter = new BaseAdapter() {
+                      @Override
+                      public int getCount() {
+                          return items.size();
+                      }
+
+                      @Override
+                      public Object getItem(int i) {
+                          return items.get(i);
+                      }
+
+                      @Override
+                      public long getItemId(int i) {
+                          return i;
+                      }
+
+                      @Override
+                      public View getView(int i, View convert, ViewGroup parent) {
+                          TextView t = convert instanceof TextView ? (TextView) convert : new TextView(KenzoDeletedActivity.this);
+                          Object[] r = items.get(i);
+                          String who = ((Integer) r[3]) == 1 ? "\\u0623\\u0646\\u062a" : nameOf((Long) r[1]);
+                          String head = who + "  |  " + new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(new Date(((Long) r[2]) * 1000L));
+                          if (did == 0) {
+                              head = nameOf((Long) r[0]) + "  |  " + head;
+                          }
+                          String kind = (String) r[4];
+                          String body = (String) r[5];
+                          String s = head + "\\n" + (kind.length() > 0 ? "[" + kind + "] " : "") + body;
+                          t.setText(s);
+                          t.setTextColor(Color.WHITE);
+                          t.setTextSize(16);
+                          t.setPadding(dp(16), dp(10), dp(16), dp(10));
+                          return t;
+                      }
+                  };
+                  list.setAdapter(adapter);
+                  list.setOnItemClickListener(new android.widget.AdapterView.OnItemClickListener() {
+                      @Override
+                      public void onItemClick(android.widget.AdapterView<?> p, View v, int i, long id) {
+                          try {
+                              String body = (String) items.get(i)[5];
+                              ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                              cm.setPrimaryClip(ClipData.newPlainText("kenzo", body));
+                              Toast.makeText(KenzoDeletedActivity.this, "\\u062a\\u0645 \\u0627\\u0644\\u0646\\u0633\\u062e", Toast.LENGTH_SHORT).show();
+                          } catch (Throwable ignore) {
+                          }
+                      }
+                  });
+                  root.addView(list, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+                  setContentView(root);
+                  reload();
+              }
+
+              private void reload() {
+                  items = KenzoDeleted.list(account, did);
+                  adapter.notifyDataSetChanged();
+              }
+          }
+          """
+          write(path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "KenzoDeletedActivity.java"), kenzo_act)
+
+          MS = path("TMessagesProj", "src", "main", "java", "org", "telegram", "messenger", "MessagesStorage.java")
+          replace_exact(
+              MS,
+              "    private ArrayList<Long> markMessagesAsDeletedInternal(long dialogId, ArrayList<Integer> messages, boolean deleteFiles, int mode, int threadMessageId) {\n        SQLiteCursor cursor = null;\n        SQLitePreparedStatement state = null;\n        try {\n",
+              "    private ArrayList<Long> markMessagesAsDeletedInternal(long dialogId, ArrayList<Integer> messages, boolean deleteFiles, int mode, int threadMessageId) {\n        SQLiteCursor cursor = null;\n        SQLitePreparedStatement state = null;\n        try {\n            KenzoDeleted.snapshot(currentAccount, database, dialogId, messages, mode);\n",
+          )
+
+          man = path("TMessagesProj_App", "src", "main", "AndroidManifest.xml")
+          replace_exact(
+              man,
+              '        <service\n            android:name="org.telegram.messenger.GoogleVoiceClientService"',
+              '        <activity android:name="org.telegram.messenger.KenzoDeletedActivity" android:exported="false" />\n        <service\n            android:name="org.telegram.messenger.GoogleVoiceClientService"',
+          )
+
+          CA = path("TMessagesProj", "src", "main", "java", "org", "telegram", "ui", "ChatActivity.java")
+          replace_exact(
+              CA,
+              "            if (searchItem != null) {\n                headerItem.lazilyAddSubItem(search, R.drawable.msg_search, LocaleController.getString(R.string.Search));\n            }\n",
+              "            headerItem.lazilyAddSubItem(9001, R.drawable.msg_delete, \"\\u0627\\u0644\\u0645\\u062d\\u0630\\u0648\\u0641\\u0627\\u062a\");\n            headerItem.lazilyAddSubItem(9002, R.drawable.msg_autodelete, \"\\u0642\\u064a\\u0627\\u0633 \\u0633\\u0631\\u0639\\u0629 \\u0627\\u0644\\u0625\\u0631\\u0633\\u0627\\u0644\");\n            if (searchItem != null) {\n                headerItem.lazilyAddSubItem(search, R.drawable.msg_search, LocaleController.getString(R.string.Search));\n            }\n",
+          )
+          replace_exact(
+              CA,
+              "                } else if (id == search) {\n",
+              "                } else if (id == 9001) {\n                    android.content.Intent kzIntent = new android.content.Intent(getParentActivity(), org.telegram.messenger.KenzoDeletedActivity.class);\n                    kzIntent.putExtra(\"account\", currentAccount);\n                    kzIntent.putExtra(\"did\", getDialogId());\n                    getParentActivity().startActivity(kzIntent);\n                } else if (id == 9002) {\n                    boolean kzOn = org.telegram.messenger.KenzoNet.toggleMeter();\n                    android.widget.Toast.makeText(getParentActivity(), kzOn ? \"ON\" : \"OFF\", android.widget.Toast.LENGTH_SHORT).show();\n                } else if (id == search) {\n",
+          )
+
+          # low latency audio -------------------------------------------------------------
+          WAT = path("TMessagesProj", "src", "main", "java", "org", "webrtc", "voiceengine", "WebRtcAudioTrack.java")
+          replace_exact(
+              WAT,
+              "    // Create an audio track where the audio usage is for VoIP and the content type is speech.\n    return new AudioTrack(",
+              "    if (android.os.Build.VERSION.SDK_INT >= 26) {\n      try {\n        return new AudioTrack.Builder()\n            .setAudioAttributes(new AudioAttributes.Builder()\n                .setUsage(usageAttribute)\n                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)\n                .build())\n            .setAudioFormat(new AudioFormat.Builder()\n                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)\n                .setSampleRate(sampleRateInHz)\n                .setChannelMask(channelConfig)\n                .build())\n            .setBufferSizeInBytes(bufferSizeInBytes)\n            .setTransferMode(AudioTrack.MODE_STREAM)\n            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)\n            .build();\n      } catch (Throwable e) {\n        Logging.w(TAG, \"low latency track failed, using default\");\n      }\n    }\n    // Create an audio track where the audio usage is for VoIP and the content type is speech.\n    return new AudioTrack(",
+          )
+
+          # ---------------------------------------------------------------- name and icon
+          strings = path("TMessagesProj", "src", "main", "res", "values", "strings.xml")
+          replace_exact(strings, '<string name="AppName">Telegram</string>', '<string name="AppName">%s</string>' % NEW_NAME)
+
+          from PIL import Image, ImageDraw  # noqa: E402
+
+          src = Image.open(io.BytesIO(base64.b64decode(ICON_B64))).convert("RGBA")
+          res = path("TMessagesProj", "src", "main", "res")
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+          for density, px in sizes.items():
+              square = src.resize((px, px), Image.LANCZOS)
+              square.save(os.path.join(res, "mipmap-" + density, "ic_launcher.png"))
+              mask = Image.new("L", (px * 4, px * 4), 0)
+              ImageDraw.Draw(mask).ellipse((0, 0, px * 4 - 1, px * 4 - 1), fill=255)
+              mask = mask.resize((px, px), Image.LANCZOS)
+              round_icon = square.copy()
+              round_icon.putalpha(mask)
+              round_icon.save(os.path.join(res, "mipmap-" + density, "ic_launcher_round.png"))
+
+          for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              adaptive = os.path.join(res, "mipmap-anydpi-v26", name)
+              if not os.path.exists(adaptive):
+                  fail("missing " + adaptive)
+              os.remove(adaptive)
+
+          print("PATCH-OK")
+          PYEOF
+          cat > icon.b64 <<'B64EOF'
+          iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAMAAABlApw1AAABgFBMVEX///////7//f/+///+/v7+
+          /P/9/f3/+///+/7++/7++f77+vz7+f74+Pz79/749/739vz29vr19Pj08/jy8vXy8Pfv8PXu7vTs
+          7PPq6fDn6PDm5u/k4+3h4+7g4Ord3+rb3Oba2uTW2eXW1uDT1eDQ0d3Oz9vNzNjJy9fFxtPAw9C+
+          vcu4use2tcGws8CurbmnqrilpbGeorGbnauZmKSTl6aQkqCPjpuJjZuJiJWCh5SAgo58fIl1eYZy
+          cn5rb3xoaXVhZXBdXmpWWmVTVGBMUFtKSlhDR1FCQ1A8QUs7PUg2OkQzNkAwMj4rLzcoKjQkKC8j
+          JC4fIykfICkbHyUZHSMZHCIYGiETGR0RGx8RGRwRGRsRGBwQGBsUFh0SFxoRFhoRFBsRFBkRFBYS
+          EhoQFRkQExgPEhcQEBcNEBQMDRQKCxALDA4KChEIDREICxAICg4ICQ4ICAkFCAkGBgkDBgcDAwYB
+          BAgAAwgBAwMBAgYBAQEAAQMAAAMBAAAAAABd1nlYAABNJ0lEQVR42q19h0MTWfd2xJBdDJH0XiY9
+          k0nvycyk9w4Ewr6vBkUpQUQ6K+Bv//XvnDsJxbZ+u+9VMSDB89zTnnPunXtFbgfbqNayFpvFRlF8
+          tRTxWvQ0I9drNFqtRqPTmSwWV5Fna41qOR90GLVKhUK1QoZ8xRXQKVbmQ7ayvCxbXn4B47cXwvht
+          NsiX5LPvkytkL5VKDfxsK5MtVvIBr9tBUZTVBoNygBi+YNChUunNVgNKoNXp9HqD0WgwWWwOlydR
+          a3V7/X6/V00G/LTP6xN5Hbl6tR5DAHYrXy3HbVZ9xKrRgfxarU5vMtssiQpbbtarpYTPptUo5ap7
+          ADS1olp5GMs4Hgv+MH7/beHF4uLyCqJQKpUqFYqfzBf5QtDjcSEAyu5wOu0OOprJRii91e2x6lQa
+          HCiFXm80Gi1WQEDH2XKr1W5wQdrv83o8bpGbStSLUa/FYqEswUqlwliNvuCKDt6o0egNJr3V4a8U
+          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
+          gG7QH/4/ifMpLD6UJE8AAAAASUVORK5CYII=
+          B64EOF
+          python3 patch.py tg icon.b64 2>&1 | tee build.log
+
+      - name: Build the app (long step, about 1 to 2 hours)
+        run: |
+          set -o pipefail
+          cd tg
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx6g -XX:MaxMetaspaceSize=1g" :TMessagesProj_App:assembleAfatRelease 2>&1 | tee -a ../build.log
+
+      - name: Collect the APK
+        run: |
+          APK="$(find tg/TMessagesProj_App/build/outputs/apk -name '*.apk' | grep -i release | head -1)"
+          if [ -z "$APK" ]; then echo "PATCH-ERROR: apk not found" | tee -a build.log; find tg -name '*.apk'; exit 1; fi
+          ls -la "$APK"
+          cp "$APK" KenzOGram.apk
+
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "tg-${{ github.run_number }}" KenzOGram.apk --repo "$GITHUB_REPOSITORY" --title "KenzO Gram ${{ github.run_number }}" --notes "KenzO Gram build" --target "${{ github.sha }}"
+
+      - name: Show the problem
+        if: failure()
+        run: |
+          {
+            echo "## Build failed"
+            echo '```'
+            if [ -f build.log ]; then grep -nE "PATCH-ERROR|error:|FAILED|What went wrong|Execution failed|Could not|No space left|OutOfMemory|fatal:" build.log | tail -40; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
